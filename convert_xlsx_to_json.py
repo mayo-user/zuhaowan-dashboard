@@ -1242,6 +1242,322 @@ def read_sheet(xlsx_path, use_readonly=True):
     return headers, rows, sheet_name
 
 
+def read_sheet_safe(xlsx_path):
+    """安全读取Excel：自动处理dimension标签错误的情况"""
+    file_size = os.path.getsize(xlsx_path)
+    try:
+        headers, rows, sheet_name = read_sheet(xlsx_path, True)
+        if file_size > 50 * 1024 and (len(rows) < 10 or len(headers) <= 1):
+            headers, rows, sheet_name = read_sheet(xlsx_path, False)
+    except Exception:
+        headers, rows, sheet_name = read_sheet(xlsx_path, False)
+    return headers, rows, sheet_name
+
+
+# ========== 分销数据合并 ==========
+def get_date_range_from_rows(rows, headers):
+    """从数据中获取日期范围（min, max）"""
+    date_idx = None
+    for i, h in enumerate(headers):
+        if h.strip() == 'part_day(day)':
+            date_idx = i
+            break
+    if date_idx is None:
+        return None, None
+    dates = []
+    for row in rows:
+        if date_idx < len(row) and row[date_idx]:
+            dates.append(str(row[date_idx]))
+    if not dates:
+        return None, None
+    return min(dates), max(dates)
+
+
+def merge_distribution_datasets(headers_a, rows_a, headers_b, rows_b):
+    """
+    合并两个分销数据集（纵向拼接）。
+    取列的并集，缺失列填空字符串。
+    返回 (merged_headers, merged_rows)
+    """
+    # 构建统一列顺序：先出现在A中的，再追加B中新增的
+    merged_headers = list(headers_a)
+    for h in headers_b:
+        if h not in merged_headers:
+            merged_headers.append(h)
+
+    # 构建索引映射
+    idx_a = {h: i for i, h in enumerate(headers_a)}
+    idx_b = {h: i for i, h in enumerate(headers_b)}
+    merged_idx = {h: i for i, h in enumerate(merged_headers)}
+    num_cols = len(merged_headers)
+
+    merged_rows = []
+
+    # 追加A的数据
+    for row in rows_a:
+        new_row = [''] * num_cols
+        for h in headers_a:
+            src_i = idx_a[h]
+            dst_i = merged_idx[h]
+            if src_i < len(row):
+                new_row[dst_i] = row[src_i]
+        merged_rows.append(new_row)
+
+    # 追加B的数据
+    for row in rows_b:
+        new_row = [''] * num_cols
+        for h in headers_b:
+            src_i = idx_b[h]
+            dst_i = merged_idx[h]
+            if src_i < len(row):
+                new_row[dst_i] = row[src_i]
+        merged_rows.append(new_row)
+
+    return merged_headers, merged_rows
+
+
+def normalize_distribution_fields(headers, rows):
+    """
+    合并后字段标准化：
+    1. 结算订单量：如果"正常结算订单量"为空，用"正常订单量"回填
+    2. 自营/非自营订单量：如果为空，根据"是否自营"+结算订单量计算
+    3. 是否自营：如果为空，根据"自营结算订单量"反推
+    返回标准化后的 (headers, rows)
+    """
+    header_idx = {h: i for i, h in enumerate(headers)}
+    num_cols = len(headers)
+
+    def get_val(row, name):
+        idx = header_idx.get(name)
+        if idx is None or idx >= len(row):
+            return ''
+        return row[idx]
+
+    def set_val(row, name, value):
+        idx = header_idx.get(name)
+        if idx is None:
+            # 列不存在则追加
+            headers.append(name)
+            header_idx[name] = len(headers) - 1
+            row.append(value)
+        else:
+            while len(row) <= idx:
+                row.append('')
+            row[idx] = value
+
+    has_normal = '正常订单量' in header_idx
+    has_settled = '正常结算订单量' in header_idx
+    has_self_op = '自营结算订单量' in header_idx
+    has_non_self_op = '非自营结算订单量' in header_idx
+    has_is_self = '是否自营' in header_idx
+
+    if not (has_normal and has_settled) and not (has_is_self and (has_self_op or has_non_self_op)):
+        # 不需要标准化
+        return headers, rows
+
+    for row in rows:
+        settled_val = safe_num(get_val(row, '正常结算订单量')) if has_settled else 0
+        normal_val = safe_num(get_val(row, '正常订单量')) if has_normal else 0
+
+        # 1. 结算订单量：优先用正常结算订单量，如果为空或0且有正常订单量则用正常订单量
+        if has_settled and has_normal:
+            if settled_val == 0 and normal_val > 0:
+                set_val(row, '正常结算订单量', normal_val)
+                settled_val = normal_val
+
+        # 2. 自营/非自营订单量：根据是否自营字段计算
+        if has_is_self and (has_self_op or has_non_self_op):
+            is_self = str(get_val(row, '是否自营')).strip()
+            self_val = safe_num(get_val(row, '自营结算订单量')) if has_self_op else 0
+            non_self_val = safe_num(get_val(row, '非自营结算订单量')) if has_non_self_op else 0
+
+            if self_val == 0 and non_self_val == 0 and settled_val > 0:
+                if is_self == '是':
+                    if has_self_op:
+                        set_val(row, '自营结算订单量', settled_val)
+                else:
+                    if has_non_self_op:
+                        set_val(row, '非自营结算订单量', settled_val)
+
+        # 3. 是否自营：根据自营订单量反推
+        if has_self_op and has_is_self:
+            self_val = safe_num(get_val(row, '自营结算订单量'))
+            is_self = str(get_val(row, '是否自营')).strip()
+            if not is_self and self_val > 0:
+                set_val(row, '是否自营', '是')
+
+    return headers, rows
+
+
+def write_merged_xlsx(headers, rows, output_path):
+    """将合并后的数据写入xlsx文件"""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'sheet1'
+
+    # 写入表头
+    ws.append(headers)
+
+    # 写入数据行
+    for row in rows:
+        ws.append(row)
+
+    wb.save(output_path)
+    wb.close()
+
+
+def detect_distribution_files(xlsx_files):
+    """
+    识别分销相关的4个文件。
+    xlsx_files: {name_no_ext: full_path}
+    返回: {
+        'jia_current': path or None,   # 分销加价_本周
+        'jia_previous': path or None,  # 分销加价_上周
+        'rong_current': path or None,  # 融合需求_本周
+        'rong_previous': path or None, # 融合需求_上周
+    }
+    """
+    result = {
+        'jia_current': None,
+        'jia_previous': None,
+        'rong_current': None,
+        'rong_previous': None,
+    }
+
+    jia_files = []  # (path, date_min, date_max)
+    rong_files = []
+
+    for name, fpath in xlsx_files.items():
+        lower_name = name.lower()
+        # 跳过已经是合并产物的文件
+        if name in ('dist_current', 'dist_previous', 'sublet_current', 'sublet_previous'):
+            continue
+        if name.startswith('dist_') or name.startswith('sublet_'):
+            continue
+
+        is_jia = '分销加价' in name or 'jia_price' in lower_name or 'dist_jia' in lower_name
+        is_rong = ('融合需求' in name or '转租分销融合' in name or
+                   'dist_rong' in lower_name or 'fusion' in lower_name)
+
+        if is_jia:
+            try:
+                h, r, _ = read_sheet_safe(fpath)
+                dmin, dmax = get_date_range_from_rows(r, h)
+                jia_files.append((fpath, dmin, dmax, name))
+            except Exception:
+                jia_files.append((fpath, None, None, name))
+        elif is_rong:
+            try:
+                h, r, _ = read_sheet_safe(fpath)
+                dmin, dmax = get_date_range_from_rows(r, h)
+                rong_files.append((fpath, dmin, dmax, name))
+            except Exception:
+                rong_files.append((fpath, None, None, name))
+
+    # 按日期排序，日期大的是本周（current）
+    def sort_key(item):
+        _, dmin, dmax, _ = item
+        return (dmax or '0', dmin or '0')
+
+    jia_files.sort(key=sort_key, reverse=True)
+    rong_files.sort(key=sort_key, reverse=True)
+
+    if len(jia_files) >= 1:
+        result['jia_current'] = jia_files[0][0]
+    if len(jia_files) >= 2:
+        result['jia_previous'] = jia_files[1][0]
+    if len(rong_files) >= 1:
+        result['rong_current'] = rong_files[0][0]
+    if len(rong_files) >= 2:
+        result['rong_previous'] = rong_files[1][0]
+
+    return result
+
+
+def merge_distribution_to_output(data_dir, dist_files):
+    """
+    合并分销数据并生成 dist_current.xlsx / dist_previous.xlsx
+    返回: (current_path, previous_path)
+    """
+    current_path = None
+    previous_path = None
+
+    # 本周合并
+    jia_cur = dist_files.get('jia_current')
+    rong_cur = dist_files.get('rong_current')
+    if jia_cur or rong_cur:
+        print("  合并分销本周数据...")
+        merged_headers = []
+        merged_rows = []
+        sources = []
+
+        if jia_cur:
+            h, r, _ = read_sheet_safe(jia_cur)
+            sources.append(('分销加价', len(r)))
+            if not merged_headers:
+                merged_headers, merged_rows = h, r
+            else:
+                merged_headers, merged_rows = merge_distribution_datasets(
+                    merged_headers, merged_rows, h, r
+                )
+
+        if rong_cur:
+            h, r, _ = read_sheet_safe(rong_cur)
+            sources.append(('融合需求', len(r)))
+            if not merged_headers:
+                merged_headers, merged_rows = h, r
+            else:
+                merged_headers, merged_rows = merge_distribution_datasets(
+                    merged_headers, merged_rows, h, r
+                )
+
+        current_path = os.path.join(data_dir, 'dist_current.xlsx')
+        # 字段标准化（统一结算订单量、自营字段等）
+        merged_headers, merged_rows = normalize_distribution_fields(merged_headers, merged_rows)
+        write_merged_xlsx(merged_headers, merged_rows, current_path)
+        src_info = ' + '.join(f'{n}({c}行)' for n, c in sources)
+        print(f"    {src_info} → 共{len(merged_rows)}行 × {len(merged_headers)}列")
+
+    # 上周合并
+    jia_prev = dist_files.get('jia_previous')
+    rong_prev = dist_files.get('rong_previous')
+    if jia_prev or rong_prev:
+        print("  合并分销上周数据...")
+        merged_headers = []
+        merged_rows = []
+        sources = []
+
+        if jia_prev:
+            h, r, _ = read_sheet_safe(jia_prev)
+            sources.append(('分销加价', len(r)))
+            if not merged_headers:
+                merged_headers, merged_rows = h, r
+            else:
+                merged_headers, merged_rows = merge_distribution_datasets(
+                    merged_headers, merged_rows, h, r
+                )
+
+        if rong_prev:
+            h, r, _ = read_sheet_safe(rong_prev)
+            sources.append(('融合需求', len(r)))
+            if not merged_headers:
+                merged_headers, merged_rows = h, r
+            else:
+                merged_headers, merged_rows = merge_distribution_datasets(
+                    merged_headers, merged_rows, h, r
+                )
+
+        previous_path = os.path.join(data_dir, 'dist_previous.xlsx')
+        # 字段标准化（统一结算订单量、自营字段等）
+        merged_headers, merged_rows = normalize_distribution_fields(merged_headers, merged_rows)
+        write_merged_xlsx(merged_headers, merged_rows, previous_path)
+        src_info = ' + '.join(f'{n}({c}行)' for n, c in sources)
+        print(f"    {src_info} → 共{len(merged_rows)}行 × {len(merged_headers)}列")
+
+    return current_path, previous_path
+
+
 # ========== 单文件转换 ==========
 def convert_xlsx_to_json(xlsx_path, generate_summary=True):
     """将 xlsx 文件转换为 JSON 格式（原始明细 + 预计算摘要）"""
@@ -1331,9 +1647,52 @@ def batch_process(data_dir):
 
     print(f"找到 {len(xlsx_files)} 个 xlsx 文件")
 
+    # ===== 分销数据合并（双系统）=====
+    print()
+    print("--- 分销双系统数据合并 ---")
+    dist_files = detect_distribution_files(xlsx_files)
+    has_jia = dist_files['jia_current'] or dist_files['jia_previous']
+    has_rong = dist_files['rong_current'] or dist_files['rong_previous']
+
+    if has_jia and has_rong:
+        print("检测到分销加价 + 融合需求两套数据，开始合并...")
+        cur_path, prev_path = merge_distribution_to_output(data_dir, dist_files)
+        # 将合并后的文件加入 xlsx_files
+        if cur_path and os.path.exists(cur_path):
+            xlsx_files['dist_current'] = cur_path
+        if prev_path and os.path.exists(prev_path):
+            xlsx_files['dist_previous'] = prev_path
+        print("  合并完成！")
+    elif has_jia and not has_rong:
+        print("检测到分销加价数据（无融合需求数据），跳过合并")
+    elif has_rong and not has_jia:
+        print("检测到融合需求数据（无分销加价数据），跳过合并")
+    else:
+        print("未检测到分销双系统数据，使用原有 dist_current / dist_previous")
+
+    print()
+
+    # ===== 只转换规范命名的文件 =====
+    # 规范文件：sublet_current, sublet_previous, dist_current, dist_previous
+    canonical_files = ['sublet_current', 'sublet_previous', 'dist_current', 'dist_previous']
+    to_convert = {}
+    skipped = []
+
+    for name, fpath in sorted(xlsx_files.items()):
+        if name in canonical_files:
+            to_convert[name] = fpath
+        else:
+            skipped.append(name)
+
+    if skipped:
+        print(f"跳过 {len(skipped)} 个非规范命名文件（仅用于合并，不单独转换）")
+        for s in skipped:
+            print(f"  - {s}.xlsx")
+        print()
+
     # 逐个转换
     results = {}
-    for name, fpath in sorted(xlsx_files.items()):
+    for name, fpath in sorted(to_convert.items()):
         success = convert_xlsx_to_json(fpath, generate_summary=True)
         results[name] = success
         print()
@@ -1345,28 +1704,14 @@ def batch_process(data_dir):
     # 转租对比
     sublet_current = None
     sublet_previous = None
-    for prefix in ['sublet_current', 'sublet_prev', 'sublet_last']:
-        for name in xlsx_files:
-            if name == prefix:
-                summary_path = os.path.join(data_dir, name + '_summary.json')
-                if os.path.exists(summary_path):
-                    with open(summary_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    if prefix == 'sublet_current':
-                        sublet_current = data
-                    else:
-                        sublet_previous = data
-                    break
-
-    # 尝试 alternative names
-    if sublet_previous is None:
-        for name in xlsx_files:
-            if 'sublet' in name and ('previous' in name or 'prev' in name or 'last' in name):
-                summary_path = os.path.join(data_dir, name + '_summary.json')
-                if os.path.exists(summary_path):
-                    with open(summary_path, 'r', encoding='utf-8') as f:
-                        sublet_previous = json.load(f)
-                    break
+    sublet_cur_path = os.path.join(data_dir, 'sublet_current_summary.json')
+    sublet_prev_path = os.path.join(data_dir, 'sublet_previous_summary.json')
+    if os.path.exists(sublet_cur_path):
+        with open(sublet_cur_path, 'r', encoding='utf-8') as f:
+            sublet_current = json.load(f)
+    if os.path.exists(sublet_prev_path):
+        with open(sublet_prev_path, 'r', encoding='utf-8') as f:
+            sublet_previous = json.load(f)
 
     if sublet_current and sublet_previous:
         comparison = compute_comparison(sublet_current, sublet_previous, 'sublet')
@@ -1381,17 +1726,14 @@ def batch_process(data_dir):
     # 分销对比
     dist_current = None
     dist_previous = None
-    for name in xlsx_files:
-        if name == 'dist_current':
-            summary_path = os.path.join(data_dir, name + '_summary.json')
-            if os.path.exists(summary_path):
-                with open(summary_path, 'r', encoding='utf-8') as f:
-                    dist_current = json.load(f)
-        elif 'dist' in name and ('previous' in name or 'prev' in name or 'last' in name):
-            summary_path = os.path.join(data_dir, name + '_summary.json')
-            if os.path.exists(summary_path):
-                with open(summary_path, 'r', encoding='utf-8') as f:
-                    dist_previous = json.load(f)
+    dist_cur_path = os.path.join(data_dir, 'dist_current_summary.json')
+    dist_prev_path = os.path.join(data_dir, 'dist_previous_summary.json')
+    if os.path.exists(dist_cur_path):
+        with open(dist_cur_path, 'r', encoding='utf-8') as f:
+            dist_current = json.load(f)
+    if os.path.exists(dist_prev_path):
+        with open(dist_prev_path, 'r', encoding='utf-8') as f:
+            dist_previous = json.load(f)
 
     if dist_current and dist_previous:
         comparison = compute_comparison(dist_current, dist_previous, 'distribution')
