@@ -26,10 +26,10 @@
 │   ├── charts.js                # 图表渲染模块
 │   └── main.js                  # 主逻辑（含自动加载 data/ 目录数据）
 └── data/                        # 数据文件（每周更新这里）
-    ├── 转租_本周.xlsx
-    ├── 转租_上周.xlsx
-    ├── 分销_本周.xlsx
-    └── 分销_上周.xlsx
+    ├── sublet_current.xlsx      # 转租本周数据
+    ├── sublet_previous.xlsx     # 转租上周数据
+    ├── dist_current.xlsx        # 分销本周数据
+    └── dist_previous.xlsx       # 分销上周数据
 ```
 
 **核心逻辑**：页面打开时，`main.js` 会自动通过 HTTP 请求加载 `data/` 目录下的4个 Excel 文件并渲染看板。每周更新数据时，只需替换 `data/` 目录下的文件即可。
@@ -127,10 +127,10 @@
 
 | 文件名 | 说明 |
 |--------|------|
-| `转租_本周.xlsx` | 转租业务本周数据 |
-| `转租_上周.xlsx` | 转租业务上周数据（用于环比） |
-| `分销_本周.xlsx` | 分销业务本周数据 |
-| `分销_上周.xlsx` | 分销业务上周数据（用于环比） |
+| `sublet_current.xlsx` | 转租业务本周数据 |
+| `sublet_previous.xlsx` | 转租业务上周数据（用于环比） |
+| `dist_current.xlsx` | 分销业务本周数据 |
+| `dist_previous.xlsx` | 分销业务上周数据（用于环比） |
 
 ### 2. 上传到仓库
 

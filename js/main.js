@@ -385,10 +385,10 @@
         // 注意：需要通过 HTTP 服务器打开才有效，直接双击HTML无法读取本地文件
         
         const dataFiles = [
-            { name: '转租_本周.xlsx', type: 'sublet', week: 'thisWeek' },
-            { name: '转租_上周.xlsx', type: 'sublet', week: 'lastWeek' },
-            { name: '分销_本周.xlsx', type: 'distribution', week: 'thisWeek' },
-            { name: '分销_上周.xlsx', type: 'distribution', week: 'lastWeek' }
+            { name: 'sublet_current.xlsx', type: 'sublet', week: 'thisWeek' },
+            { name: 'sublet_previous.xlsx', type: 'sublet', week: 'lastWeek' },
+            { name: 'dist_current.xlsx', type: 'distribution', week: 'thisWeek' },
+            { name: 'dist_previous.xlsx', type: 'distribution', week: 'lastWeek' }
         ];
 
         let loadedCount = 0;
