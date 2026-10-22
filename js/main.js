@@ -337,7 +337,6 @@
         });
 
         try {
-            let result;
             let processedData;
             
             // 先尝试从缓存读取处理后的数据
@@ -347,38 +346,55 @@
                 processedData = cachedData;
                 console.log('[Upload] 命中缓存:', file.name);
             } else {
-                // 解析文件
                 if (isJson) {
-                    // JSON 格式 - 快速路径
-                    result = await DataProcessor.readJsonFile(file, (pct) => {
-                        updateLoadingProgress(pct, '解析JSON数据...');
+                    // JSON 格式：先检测是否为预计算摘要
+                    const jsonData = await DataProcessor.readJsonFileRaw(file, (pct) => {
+                        updateLoadingProgress(pct * 0.6, '解析JSON数据...');
                     });
+
+                    // 检测是否为预计算摘要（有 dataType 字段）
+                    if (DataProcessor.isSummaryData(jsonData)) {
+                        // 摘要文件，直接使用（跳过聚合计算）
+                        updateLoadingProgress(85, '摘要数据，跳过聚合...');
+                        processedData = jsonData;
+                        console.log('[Upload] 检测到预计算摘要:', file.name);
+                    } else {
+                        // 原始明细 JSON，需要聚合处理
+                        updateLoadingProgress(70, '处理数据...');
+                        const result = DataProcessor.jsonRawToRows(jsonData);
+                        const dataType = DataProcessor.detectDataType(result.headers);
+                        if (dataType === 'sublet') {
+                            processedData = DataProcessor.processSubletData(result.rows, result.headers);
+                        } else if (dataType === 'distribution') {
+                            processedData = DataProcessor.processDistributionData(result.rows, result.headers);
+                        } else {
+                            throw new Error('无法识别数据类型，请检查文件内容');
+                        }
+                    }
                 } else {
                     // Excel 格式 - 使用 Web Worker 避免阻塞主线程
-                    result = await DataProcessor.readExcelFileWithWorker(file, (pct) => {
-                        updateLoadingProgress(pct, `解析Excel数据 (${fileSizeMB}MB)...`);
+                    const result = await DataProcessor.readExcelFileWithWorker(file, (pct) => {
+                        updateLoadingProgress(pct * 0.6, `解析Excel数据 (${fileSizeMB}MB)...`);
                     });
-                }
 
-                updateLoadingProgress(85, '处理数据...');
-                
-                const dataType = DataProcessor.detectDataType(result.headers);
-                
-                if (dataType === 'sublet') {
-                    processedData = DataProcessor.processSubletData(result.rows, result.headers);
-                } else if (dataType === 'distribution') {
-                    processedData = DataProcessor.processDistributionData(result.rows, result.headers);
-                } else {
-                    throw new Error('无法识别数据类型，请检查文件内容');
+                    updateLoadingProgress(75, '处理数据...');
+                    const dataType = DataProcessor.detectDataType(result.headers);
+                    if (dataType === 'sublet') {
+                        processedData = DataProcessor.processSubletData(result.rows, result.headers);
+                    } else if (dataType === 'distribution') {
+                        processedData = DataProcessor.processDistributionData(result.rows, result.headers);
+                    } else {
+                        throw new Error('无法识别数据类型，请检查文件内容');
+                    }
                 }
 
                 // 存入缓存（异步，不阻塞）
                 StorageCache.set(cacheKey, processedData).then(() => {
-                    StorageCache.cleanup(20); // 清理旧缓存，保留最近20条
+                    StorageCache.cleanup(20);
                 });
             }
 
-            updateLoadingProgress(95, '渲染看板...');
+            updateLoadingProgress(92, '渲染看板...');
 
             const dataType = processedData.dataType;
             if (dataType === 'sublet') {
@@ -417,7 +433,6 @@
             updateDataStatus();
             updateLoadingProgress(100, '加载完成');
             
-            // 短暂延迟后关闭加载层，让用户看到100%
             setTimeout(() => showLoading(false), 300);
         } catch (err) {
             console.error('文件读取失败:', err);
@@ -428,7 +443,199 @@
 
     // ========== 自动加载 data/ 目录文件 ==========
     async function autoLoadDataFiles() {
-        // 优先加载 JSON 格式（速度快10倍以上），其次是 xlsx
+        // 方案A：优先加载预计算摘要（速度最快，减少 90%+ 数据量）
+        // 方案B：回退到原始明细数据加载（向后兼容）
+
+        // ========== 第一步：尝试预计算摘要模式 ==========
+        const summaryResult = await tryLoadSummaryMode();
+        if (summaryResult && summaryResult.loadedCount > 0) {
+            // 摘要模式加载成功，直接渲染
+            finishAutoLoad(summaryResult);
+            return;
+        }
+
+        // ========== 第二步：回退到原始数据模式 ==========
+        console.log('[AutoLoad] 预计算摘要不可用，回退到原始数据模式');
+        await loadRawDataMode();
+    }
+
+    /**
+     * 尝试加载预计算摘要数据（最快路径）
+     * 加载 *_summary.json 和 *_comparison.json
+     */
+    async function tryLoadSummaryMode() {
+        const summaryFiles = [
+            { summary: 'sublet_current_summary.json', comparison: 'sublet_comparison.json', type: 'sublet', week: 'thisWeek' },
+            { summary: 'sublet_previous_summary.json', type: 'sublet', week: 'lastWeek' },
+            { summary: 'dist_current_summary.json', comparison: 'dist_comparison.json', type: 'distribution', week: 'thisWeek' },
+            { summary: 'dist_previous_summary.json', type: 'distribution', week: 'lastWeek' }
+        ];
+
+        // 探测摘要文件是否存在
+        const existingSummaries = [];
+        for (const f of summaryFiles) {
+            const url = 'data/' + f.summary;
+            const exists = await checkFileExists(url);
+            if (exists) {
+                existingSummaries.push({ ...f, url: url });
+            }
+        }
+
+        if (existingSummaries.length === 0) {
+            return null;
+        }
+
+        console.log('[AutoLoad] 发现预计算摘要文件:', existingSummaries.map(f => f.summary).join(', '));
+
+        showLoading(true, {
+            text: '加载数据摘要...',
+            percent: 0,
+            showProgress: true,
+            tip: '预计算摘要模式，加载速度提升 10 倍以上'
+        });
+
+        let loadedCount = 0;
+        let currentIndex = 0;
+        let loadedSubletThisWeek = false;
+        let loadedSubletLastWeek = false;
+        let loadedDistThisWeek = false;
+        let loadedDistLastWeek = false;
+        let subletComparisonLoaded = false;
+        let distComparisonLoaded = false;
+
+        // 加载摘要文件
+        for (const f of existingSummaries) {
+            currentIndex++;
+            const basePercent = ((currentIndex - 1) / existingSummaries.length) * 80;
+
+            try {
+                updateLoadingProgress(basePercent + 5,
+                    `加载摘要 ${currentIndex}/${existingSummaries.length}...`);
+
+                // 尝试缓存
+                const cacheKey = 'summary_' + f.summary;
+                const cachedData = await StorageCache.get(cacheKey);
+
+                let summaryData;
+                if (cachedData) {
+                    summaryData = cachedData;
+                    console.log('[AutoLoad] 摘要命中缓存:', f.summary);
+                } else {
+                    const response = await fetch(f.url);
+                    if (!response.ok) continue;
+                    summaryData = await response.json();
+                    // 存入缓存（异步）
+                    StorageCache.set(cacheKey, summaryData);
+                }
+
+                if (summaryData && summaryData.dataType) {
+                    if (f.type === 'sublet') {
+                        if (f.week === 'thisWeek') {
+                            state.subletThisWeek = summaryData;
+                            loadedSubletThisWeek = true;
+                        } else {
+                            state.subletLastWeek = summaryData;
+                            loadedSubletLastWeek = true;
+                        }
+                    } else if (f.type === 'distribution') {
+                        if (f.week === 'thisWeek') {
+                            state.distThisWeek = summaryData;
+                            loadedDistThisWeek = true;
+                        } else {
+                            state.distLastWeek = summaryData;
+                            loadedDistLastWeek = true;
+                        }
+                    }
+                    loadedCount++;
+                }
+
+                updateLoadingProgress(basePercent + (80 / existingSummaries.length),
+                    `摘要 ${currentIndex}/${existingSummaries.length} 完成`);
+            } catch (err) {
+                console.warn('[AutoLoad] 摘要加载失败:', f.summary, err);
+            }
+        }
+
+        // 尝试加载对比摘要（如果有本周数据）
+        let compLoadPromises = [];
+
+        if (loadedSubletThisWeek) {
+            compLoadPromises.push((async () => {
+                const compUrl = 'data/sublet_comparison.json';
+                const compExists = await checkFileExists(compUrl);
+                if (compExists) {
+                    try {
+                        const cacheKey = 'summary_sublet_comparison';
+                        const cached = await StorageCache.get(cacheKey);
+                        let compData;
+                        if (cached) {
+                            compData = cached;
+                        } else {
+                            const resp = await fetch(compUrl);
+                            if (resp.ok) {
+                                compData = await resp.json();
+                                StorageCache.set(cacheKey, compData);
+                            }
+                        }
+                        if (compData) {
+                            state.subletComparison = compData;
+                            subletComparisonLoaded = true;
+                            console.log('[AutoLoad] 转租对比摘要加载成功');
+                        }
+                    } catch (e) {
+                        console.warn('[AutoLoad] 转租对比摘要加载失败', e);
+                    }
+                }
+            })());
+        }
+
+        if (loadedDistThisWeek) {
+            compLoadPromises.push((async () => {
+                const compUrl = 'data/dist_comparison.json';
+                const compExists = await checkFileExists(compUrl);
+                if (compExists) {
+                    try {
+                        const cacheKey = 'summary_dist_comparison';
+                        const cached = await StorageCache.get(cacheKey);
+                        let compData;
+                        if (cached) {
+                            compData = cached;
+                        } else {
+                            const resp = await fetch(compUrl);
+                            if (resp.ok) {
+                                compData = await resp.json();
+                                StorageCache.set(cacheKey, compData);
+                            }
+                        }
+                        if (compData) {
+                            state.distComparison = compData;
+                            distComparisonLoaded = true;
+                            console.log('[AutoLoad] 分销对比摘要加载成功');
+                        }
+                    } catch (e) {
+                        console.warn('[AutoLoad] 分销对比摘要加载失败', e);
+                    }
+                }
+            })());
+        }
+
+        await Promise.all(compLoadPromises);
+
+        return {
+            loadedCount,
+            loadedSubletThisWeek,
+            loadedSubletLastWeek,
+            loadedDistThisWeek,
+            loadedDistLastWeek,
+            subletComparisonLoaded,
+            distComparisonLoaded
+        };
+    }
+
+    /**
+     * 原始数据加载模式（向后兼容）
+     */
+    async function loadRawDataMode() {
         const dataFiles = [
             { json: 'sublet_current.json', xlsx: 'sublet_current.xlsx', type: 'sublet', week: 'thisWeek' },
             { json: 'sublet_previous.json', xlsx: 'sublet_previous.xlsx', type: 'sublet', week: 'lastWeek' },
@@ -438,15 +645,10 @@
 
         let loadedCount = 0;
         let currentIndex = 0;
-
-        // 第一步：探测哪些文件存在（先用 HEAD 探测，失败则直接 fetch 试）
-        // 同时收集 ETag/Last-Modified 用于缓存键
         const existingFiles = [];
 
         for (const f of dataFiles) {
             let found = false;
-            
-            // 依次尝试 JSON 和 xlsx
             const candidates = [
                 { name: f.json, format: 'json' },
                 { name: f.xlsx, format: 'xlsx' }
@@ -454,56 +656,22 @@
 
             for (const cand of candidates) {
                 const url = 'data/' + cand.name;
-                let etag = '';
-                let lastMod = '';
-                let exists = false;
-
-                // 先用 HEAD 探测（轻量）
-                try {
-                    const resp = await fetch(url, { method: 'HEAD' });
-                    if (resp.ok) {
-                        exists = true;
-                        etag = resp.headers.get('ETag') || '';
-                        lastMod = resp.headers.get('Last-Modified') || '';
-                    }
-                } catch (e) {
-                    // HEAD 请求失败（可能服务器不支持），直接用 GET 试一次
-                    // 不 catch 错误，让外层处理
-                }
-
-                // 如果 HEAD 失败或不存在，尝试直接 GET 探测（仅限 JSON 文件，体积相对可控时）
-                // 实际上对于 xlsx 大文件，HEAD 是必要的
-                if (!exists) {
-                    try {
-                        const resp = await fetch(url, { method: 'GET' });
-                        if (resp.ok) {
-                            exists = true;
-                            etag = resp.headers.get('ETag') || '';
-                            lastMod = resp.headers.get('Last-Modified') || '';
-                            // 直接丢弃响应体，不消耗带宽
-                            // 实际上 fetch 已经下载了，所以这种情况只作为 fallback
-                        }
-                    } catch (e) { /* 确实不存在或网络错误 */ }
-                }
-
+                const exists = await checkFileExists(url);
                 if (exists) {
                     existingFiles.push({
                         ...f,
                         format: cand.format,
                         name: cand.name,
-                        url: url,
-                        etag: etag,
-                        lastMod: lastMod
+                        url: url
                     });
                     found = true;
-                    break; // 找到一个格式就停（JSON 优先）
+                    break;
                 }
             }
         }
 
         if (existingFiles.length === 0) return;
 
-        // 显示加载层
         const hasXlsx = existingFiles.some(f => f.format === 'xlsx');
         showLoading(true, {
             text: '加载数据文件...',
@@ -512,7 +680,6 @@
             tip: hasXlsx ? '首次加载大文件较慢，后续会自动缓存加速' : ''
         });
 
-        // 第二步：逐个加载并解析
         for (const f of existingFiles) {
             currentIndex++;
             const basePercent = ((currentIndex - 1) / existingFiles.length) * 100;
@@ -522,12 +689,9 @@
                 updateLoadingProgress(basePercent + 5, `加载${fileLabel}文件 ${currentIndex}/${existingFiles.length}...`);
 
                 let processedData;
-                
-                // 缓存键：文件名 + ETag 或 Last-Modified（确保文件变化时缓存失效）
-                const cacheVersion = f.etag || f.lastMod || 'noversion';
-                const cacheKey = 'autoload_' + f.name + '_' + cacheVersion;
+                const cacheKey = 'autoload_raw_' + f.name;
                 const cachedData = await StorageCache.get(cacheKey);
-                
+
                 if (cachedData) {
                     processedData = cachedData;
                     console.log('[AutoLoad] 命中缓存:', f.name);
@@ -536,34 +700,30 @@
                     let result;
                     if (f.format === 'json') {
                         result = await DataProcessor.loadJsonFromUrl(f.url, (pct) => {
-                            updateLoadingProgress(basePercent + (pct / existingFiles.length) * 0.75, 
+                            updateLoadingProgress(basePercent + (pct / existingFiles.length) * 0.75,
                                 `解析${fileLabel} ${currentIndex}/${existingFiles.length}...`);
                         });
                     } else {
-                        // xlsx 文件：先 fetch 下载，再用 Web Worker 解析（大文件不卡主线程）
                         const response = await fetch(f.url);
                         if (!response.ok) continue;
                         const blob = await response.blob();
                         const file = new File([blob], f.name);
-                        
                         result = await DataProcessor.readExcelFileWithWorker(file, (pct) => {
                             updateLoadingProgress(basePercent + (pct / existingFiles.length) * 0.75,
                                 `解析${fileLabel} ${currentIndex}/${existingFiles.length}...`);
                         });
                     }
 
-                    updateLoadingProgress(basePercent + (80 / existingFiles.length), 
+                    updateLoadingProgress(basePercent + (80 / existingFiles.length),
                         `处理数据 ${currentIndex}/${existingFiles.length}...`);
-                    
+
                     const dataType = DataProcessor.detectDataType(result.headers);
-                    
                     if (dataType === 'sublet') {
                         processedData = DataProcessor.processSubletData(result.rows, result.headers);
                     } else if (dataType === 'distribution') {
                         processedData = DataProcessor.processDistributionData(result.rows, result.headers);
                     }
 
-                    // 存入缓存（异步不阻塞）
                     if (processedData) {
                         StorageCache.set(cacheKey, processedData);
                     }
@@ -579,8 +739,8 @@
                     }
                     loadedCount++;
                 }
-                
-                updateLoadingProgress((currentIndex / existingFiles.length) * 100, 
+
+                updateLoadingProgress((currentIndex / existingFiles.length) * 100,
                     `已完成 ${currentIndex}/${existingFiles.length}...`);
             } catch (err) {
                 console.warn('[AutoLoad] 加载失败:', f.name, err);
@@ -588,51 +748,85 @@
         }
 
         if (loadedCount > 0) {
-            updateLoadingProgress(95, '渲染看板...');
-            
-            // 计算环比 + 渲染（只渲染有数据的看板）
-            let hasSublet = false;
-            let hasDist = false;
+            finishAutoLoad({
+                loadedCount,
+                loadedSubletThisWeek: !!state.subletThisWeek,
+                loadedSubletLastWeek: !!state.subletLastWeek,
+                loadedDistThisWeek: !!state.distThisWeek,
+                loadedDistLastWeek: !!state.distLastWeek,
+                subletComparisonLoaded: false,
+                distComparisonLoaded: false
+            });
+        } else {
+            showLoading(false);
+        }
 
-            if (state.subletThisWeek) {
+        StorageCache.cleanup(20);
+    }
+
+    /**
+     * 完成自动加载：计算环比（如果需要）+ 渲染看板
+     */
+    function finishAutoLoad(loadResult) {
+        updateLoadingProgress(90, '渲染看板...');
+
+        let hasSublet = false;
+        let hasDist = false;
+
+        // 转租看板
+        if (loadResult.loadedSubletThisWeek) {
+            // 如果对比摘要还没加载，手动计算
+            if (!loadResult.subletComparisonLoaded) {
                 state.subletComparison = DataProcessor.computeComparison(
                     state.subletThisWeek,
                     state.subletLastWeek || state.subletThisWeek,
                     'sublet'
                 );
-                renderSubletDashboard();
-                hasSublet = true;
             }
-            if (state.distThisWeek) {
+            renderSubletDashboard();
+            hasSublet = true;
+        }
+
+        // 分销看板
+        if (loadResult.loadedDistThisWeek) {
+            if (!loadResult.distComparisonLoaded) {
                 state.distComparison = DataProcessor.computeComparison(
                     state.distThisWeek,
                     state.distLastWeek || state.distThisWeek,
                     'distribution'
                 );
-                renderDistributionDashboard();
-                hasDist = true;
             }
-
-            // 智能切换 Tab：如果只有一种数据，自动切到对应看板
-            // 避免用户看到空白页以为加载失败
-            if (hasDist && !hasSublet) {
-                switchTab('distribution');
-            } else if (hasSublet && !hasDist) {
-                switchTab('sublet');
-            }
-            // 两者都有或都没有时，保持默认（转租）
-
-            updatePeriodDisplay();
-            updateDataStatus();
-            
-            updateLoadingProgress(100, '加载完成');
-            setTimeout(() => showLoading(false), 200);
-        } else {
-            showLoading(false);
+            renderDistributionDashboard();
+            hasDist = true;
         }
+
+        // 智能切换 Tab
+        if (hasDist && !hasSublet) {
+            switchTab('distribution');
+        } else if (hasSublet && !hasDist) {
+            switchTab('sublet');
+        }
+
+        updatePeriodDisplay();
+        updateDataStatus();
+
+        updateLoadingProgress(100, '加载完成');
+        setTimeout(() => showLoading(false), 200);
 
         // 后台清理旧缓存
         StorageCache.cleanup(20);
+    }
+
+    /**
+     * 轻量检测文件是否存在（HEAD 请求）
+     */
+    async function checkFileExists(url) {
+        try {
+            const resp = await fetch(url, { method: 'HEAD' });
+            return resp.ok;
+        } catch (e) {
+            return false;
+        }
     }
 
     // ========== 筛选器初始化 ==========

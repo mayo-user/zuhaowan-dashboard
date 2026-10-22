@@ -1438,49 +1438,39 @@ const DataProcessor = (function() {
      * 比直接解析 xlsx 快 10-50 倍
      */
     async function readJsonFile(file, onProgress) {
+        const jsonData = await readJsonFileRaw(file, onProgress);
+        const objectRows = jsonRawToRows(jsonData).rows;
+        console.log('[DataProcessor] JSON 解析完成，行数:', objectRows.length);
+        return {
+            sheetNames: jsonData.sheetName ? [jsonData.sheetName] : ['Sheet1'],
+            rows: objectRows,
+            headers: jsonData.headers || [],
+            rowCount: objectRows.length,
+            sourceFormat: 'json'
+        };
+    }
+
+    /**
+     * 读取 JSON 文件原始内容（不做格式转换）
+     * 用于判断是否为摘要数据或原始明细数据
+     */
+    async function readJsonFileRaw(file, onProgress) {
         return new Promise((resolve, reject) => {
             console.log('[DataProcessor] 读取 JSON 文件:', file.name, '大小:', file.size, '字节');
-
             const reader = new FileReader();
             
             reader.onprogress = (e) => {
                 if (onProgress && e.lengthComputable) {
-                    // 读取进度占 30%
                     onProgress((e.loaded / e.total) * 30);
                 }
             };
 
             reader.onload = function(e) {
                 try {
-                    if (onProgress) onProgress(40); // 读取完成，开始解析
-                    
+                    if (onProgress) onProgress(40);
                     const jsonData = JSON.parse(e.target.result);
-                    
-                    if (onProgress) onProgress(70); // JSON 解析完成，开始转换格式
-                    
-                    // 将紧凑数组格式转换为对象数组格式（与 xlsx 解析结果一致）
-                    const headers = jsonData.headers || [];
-                    const rows = jsonData.rows || [];
-                    
-                    const objectRows = rows.map(row => {
-                        const obj = {};
-                        for (let i = 0; i < headers.length; i++) {
-                            obj[headers[i]] = row[i] !== undefined ? row[i] : '';
-                        }
-                        return obj;
-                    });
-
                     if (onProgress) onProgress(100);
-
-                    console.log('[DataProcessor] JSON 解析完成，行数:', objectRows.length);
-
-                    resolve({
-                        sheetNames: jsonData.sheetName ? [jsonData.sheetName] : ['Sheet1'],
-                        rows: objectRows,
-                        headers: headers,
-                        rowCount: objectRows.length,
-                        sourceFormat: 'json'
-                    });
+                    resolve(jsonData);
                 } catch (err) {
                     console.error('[DataProcessor] JSON 解析失败:', err);
                     reject(new Error('JSON 文件解析失败: ' + err.message));
@@ -1493,6 +1483,33 @@ const DataProcessor = (function() {
 
             reader.readAsText(file);
         });
+    }
+
+    /**
+     * 检测是否为预计算摘要数据
+     * 摘要数据有 dataType 字段（'sublet' 或 'distribution'）
+     */
+    function isSummaryData(jsonData) {
+        return jsonData && 
+               typeof jsonData === 'object' && 
+               (jsonData.dataType === 'sublet' || jsonData.dataType === 'distribution') &&
+               jsonData.totals !== undefined;
+    }
+
+    /**
+     * 将紧凑 JSON 格式转换为 { headers, rows(对象数组) } 格式
+     */
+    function jsonRawToRows(jsonData) {
+        const headers = jsonData.headers || [];
+        const rows = jsonData.rows || [];
+        const objectRows = rows.map(row => {
+            const obj = {};
+            for (let i = 0; i < headers.length; i++) {
+                obj[headers[i]] = row[i] !== undefined ? row[i] : '';
+            }
+            return obj;
+        });
+        return { headers, rows: objectRows };
     }
 
     // ========== 从 URL 加载 JSON ==========
@@ -1661,6 +1678,9 @@ const DataProcessor = (function() {
         readExcelFile,
         readExcelFileWithWorker,
         readJsonFile,
+        readJsonFileRaw,
+        isSummaryData,
+        jsonRawToRows,
         loadExcelFromUrl,
         loadJsonFromUrl,
         detectDataType,
