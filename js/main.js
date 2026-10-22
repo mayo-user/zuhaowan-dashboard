@@ -504,6 +504,8 @@
         let distComparisonLoaded = false;
 
         // 加载摘要文件
+        // 注意：自动加载的摘要文件不使用IndexedDB缓存，避免数据更新时缓存与服务器不同步
+        // 浏览器的HTTP缓存已能提供足够的性能保障（GitHub Pages CDN）
         for (const f of existingSummaries) {
             currentIndex++;
             const basePercent = ((currentIndex - 1) / existingSummaries.length) * 80;
@@ -512,21 +514,13 @@
                 updateLoadingProgress(basePercent + 5,
                     `加载摘要 ${currentIndex}/${existingSummaries.length}...`);
 
-                // 尝试缓存
-                const cacheKey = 'summary_' + f.summary;
-                const cachedData = await StorageCache.get(cacheKey);
-
-                let summaryData;
-                if (cachedData) {
-                    summaryData = cachedData;
-                    console.log('[AutoLoad] 摘要命中缓存:', f.summary);
-                } else {
-                    const response = await fetch(f.url);
-                    if (!response.ok) continue;
-                    summaryData = await response.json();
-                    // 存入缓存（异步）
-                    StorageCache.set(cacheKey, summaryData);
+                // 直接从服务器加载（走HTTP缓存），确保数据始终是最新的
+                const response = await fetch(f.url);
+                if (!response.ok) {
+                    console.warn('[AutoLoad] 摘要文件加载失败:', f.summary, response.status);
+                    continue;
                 }
+                const summaryData = await response.json();
 
                 if (summaryData && summaryData.dataType) {
                     if (f.type === 'sublet') {
@@ -547,6 +541,9 @@
                         }
                     }
                     loadedCount++;
+                    console.log('[AutoLoad] 摘要加载成功:', f.summary);
+                } else {
+                    console.warn('[AutoLoad] 摘要数据格式异常:', f.summary, 'dataType:', summaryData?.dataType);
                 }
 
                 updateLoadingProgress(basePercent + (80 / existingSummaries.length),
@@ -556,65 +553,43 @@
             }
         }
 
-        // 尝试加载对比摘要（如果有本周数据）
+        // 加载对比摘要（直接从服务器加载，不走IndexedDB缓存，确保数据一致性）
         let compLoadPromises = [];
 
         if (loadedSubletThisWeek) {
             compLoadPromises.push((async () => {
-                const compUrl = 'data/sublet_comparison.json';
-                const compExists = await checkFileExists(compUrl);
-                if (compExists) {
-                    try {
-                        const cacheKey = 'summary_sublet_comparison';
-                        const cached = await StorageCache.get(cacheKey);
-                        let compData;
-                        if (cached) {
-                            compData = cached;
-                        } else {
-                            const resp = await fetch(compUrl);
-                            if (resp.ok) {
-                                compData = await resp.json();
-                                StorageCache.set(cacheKey, compData);
-                            }
-                        }
-                        if (compData) {
+                try {
+                    const compUrl = 'data/sublet_comparison.json';
+                    const resp = await fetch(compUrl);
+                    if (resp.ok) {
+                        const compData = await resp.json();
+                        if (compData && compData.totals) {
                             state.subletComparison = compData;
                             subletComparisonLoaded = true;
                             console.log('[AutoLoad] 转租对比摘要加载成功');
                         }
-                    } catch (e) {
-                        console.warn('[AutoLoad] 转租对比摘要加载失败', e);
                     }
+                } catch (e) {
+                    console.warn('[AutoLoad] 转租对比摘要加载失败', e);
                 }
             })());
         }
 
         if (loadedDistThisWeek) {
             compLoadPromises.push((async () => {
-                const compUrl = 'data/dist_comparison.json';
-                const compExists = await checkFileExists(compUrl);
-                if (compExists) {
-                    try {
-                        const cacheKey = 'summary_dist_comparison';
-                        const cached = await StorageCache.get(cacheKey);
-                        let compData;
-                        if (cached) {
-                            compData = cached;
-                        } else {
-                            const resp = await fetch(compUrl);
-                            if (resp.ok) {
-                                compData = await resp.json();
-                                StorageCache.set(cacheKey, compData);
-                            }
-                        }
-                        if (compData) {
+                try {
+                    const compUrl = 'data/dist_comparison.json';
+                    const resp = await fetch(compUrl);
+                    if (resp.ok) {
+                        const compData = await resp.json();
+                        if (compData && compData.totals) {
                             state.distComparison = compData;
                             distComparisonLoaded = true;
                             console.log('[AutoLoad] 分销对比摘要加载成功');
                         }
-                    } catch (e) {
-                        console.warn('[AutoLoad] 分销对比摘要加载失败', e);
                     }
+                } catch (e) {
+                    console.warn('[AutoLoad] 分销对比摘要加载失败', e);
                 }
             })());
         }
@@ -790,11 +765,17 @@
         // 分销看板
         if (loadResult.loadedDistThisWeek) {
             if (!loadResult.distComparisonLoaded) {
-                state.distComparison = DataProcessor.computeComparison(
-                    state.distThisWeek,
-                    state.distLastWeek || state.distThisWeek,
-                    'distribution'
-                );
+                try {
+                    state.distComparison = DataProcessor.computeComparison(
+                        state.distThisWeek,
+                        state.distLastWeek || state.distThisWeek,
+                        'distribution'
+                    );
+                    console.log('[AutoLoad] 分销环比已手动计算完成');
+                } catch (e) {
+                    console.error('[AutoLoad] 分销环比计算失败:', e);
+                    state.distComparison = null;
+                }
             }
             renderDistributionDashboard();
             hasDist = true;
