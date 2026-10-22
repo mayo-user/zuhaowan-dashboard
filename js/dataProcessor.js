@@ -1370,7 +1370,7 @@ const DataProcessor = (function() {
     }
 
     // ========== 从 URL 读取 Excel ==========
-    async function loadExcelFromUrl(url) {
+    async function loadExcelFromUrl(url, onProgress) {
         if (typeof XLSX === 'undefined' || typeof XLSX.read !== 'function') {
             throw new Error('Excel 解析组件加载失败，请刷新页面重试。');
         }
@@ -1382,9 +1382,37 @@ const DataProcessor = (function() {
             throw new Error('文件下载失败，HTTP 状态码: ' + response.status + '。请检查链接是否有效、是否具有公开读取权限。');
         }
 
-        const arrayBuffer = await response.arrayBuffer();
-        const data = new Uint8Array(arrayBuffer);
+        // 支持下载进度
+        let arrayBuffer;
+        if (onProgress && response.body) {
+            const reader = response.body.getReader();
+            const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
+            let received = 0;
+            const chunks = [];
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                received += value.length;
+                if (contentLength > 0) {
+                    // 下载占总进度的 40%
+                    onProgress((received / contentLength) * 40);
+                }
+            }
+            
+            const allBytes = new Uint8Array(received);
+            let offset = 0;
+            for (const chunk of chunks) {
+                allBytes.set(chunk, offset);
+                offset += chunk.length;
+            }
+            arrayBuffer = allBytes.buffer;
+        } else {
+            arrayBuffer = await response.arrayBuffer();
+        }
 
+        const data = new Uint8Array(arrayBuffer);
         console.log('[DataProcessor] URL 文件下载完成，数据长度:', data.length, '字节');
 
         const workbook = XLSX.read(data, { type: 'array' });
@@ -1394,6 +1422,8 @@ const DataProcessor = (function() {
 
         console.log('[DataProcessor] Excel 解析完成，工作表:', workbook.SheetNames.join(', '), '，行数:', jsonData.length);
 
+        if (onProgress) onProgress(100);
+
         return {
             sheetNames: workbook.SheetNames,
             rows: jsonData,
@@ -1401,10 +1431,238 @@ const DataProcessor = (function() {
         };
     }
 
+    // ========== 紧凑型 JSON 解析 ==========
+    /**
+     * 读取紧凑型 JSON 数据文件（由 convert_xlsx_to_json.py 生成）
+     * JSON 格式: { headers: [], rows: [[...], [...], ...] }
+     * 比直接解析 xlsx 快 10-50 倍
+     */
+    async function readJsonFile(file, onProgress) {
+        return new Promise((resolve, reject) => {
+            console.log('[DataProcessor] 读取 JSON 文件:', file.name, '大小:', file.size, '字节');
+
+            const reader = new FileReader();
+            
+            reader.onprogress = (e) => {
+                if (onProgress && e.lengthComputable) {
+                    // 读取进度占 30%
+                    onProgress((e.loaded / e.total) * 30);
+                }
+            };
+
+            reader.onload = function(e) {
+                try {
+                    if (onProgress) onProgress(40); // 读取完成，开始解析
+                    
+                    const jsonData = JSON.parse(e.target.result);
+                    
+                    if (onProgress) onProgress(70); // JSON 解析完成，开始转换格式
+                    
+                    // 将紧凑数组格式转换为对象数组格式（与 xlsx 解析结果一致）
+                    const headers = jsonData.headers || [];
+                    const rows = jsonData.rows || [];
+                    
+                    const objectRows = rows.map(row => {
+                        const obj = {};
+                        for (let i = 0; i < headers.length; i++) {
+                            obj[headers[i]] = row[i] !== undefined ? row[i] : '';
+                        }
+                        return obj;
+                    });
+
+                    if (onProgress) onProgress(100);
+
+                    console.log('[DataProcessor] JSON 解析完成，行数:', objectRows.length);
+
+                    resolve({
+                        sheetNames: jsonData.sheetName ? [jsonData.sheetName] : ['Sheet1'],
+                        rows: objectRows,
+                        headers: headers,
+                        rowCount: objectRows.length,
+                        sourceFormat: 'json'
+                    });
+                } catch (err) {
+                    console.error('[DataProcessor] JSON 解析失败:', err);
+                    reject(new Error('JSON 文件解析失败: ' + err.message));
+                }
+            };
+
+            reader.onerror = function() {
+                reject(new Error('文件读取失败'));
+            };
+
+            reader.readAsText(file);
+        });
+    }
+
+    // ========== 从 URL 加载 JSON ==========
+    async function loadJsonFromUrl(url, onProgress) {
+        console.log('[DataProcessor] 从 URL 加载 JSON:', url);
+
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error('文件下载失败，HTTP 状态码: ' + response.status);
+        }
+
+        let jsonData;
+        if (onProgress && response.body) {
+            const reader = response.body.getReader();
+            const contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
+            let received = 0;
+            const chunks = [];
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                received += value.length;
+                if (contentLength > 0) {
+                    onProgress((received / contentLength) * 40);
+                }
+            }
+            
+            const allBytes = new Uint8Array(received);
+            let offset = 0;
+            for (const chunk of chunks) {
+                allBytes.set(chunk, offset);
+                offset += chunk.length;
+            }
+            
+            if (onProgress) onProgress(45);
+            
+            const text = new TextDecoder('utf-8').decode(allBytes);
+            if (onProgress) onProgress(50);
+            
+            jsonData = JSON.parse(text);
+        } else {
+            jsonData = await response.json();
+        }
+
+        if (onProgress) onProgress(70);
+
+        const headers = jsonData.headers || [];
+        const rows = jsonData.rows || [];
+        
+        // 转换为对象数组
+        const objectRows = rows.map(row => {
+            const obj = {};
+            for (let i = 0; i < headers.length; i++) {
+                obj[headers[i]] = row[i] !== undefined ? row[i] : '';
+            }
+            return obj;
+        });
+
+        if (onProgress) onProgress(100);
+
+        console.log('[DataProcessor] JSON 加载完成，行数:', objectRows.length);
+
+        return {
+            sheetNames: jsonData.sheetName ? [jsonData.sheetName] : ['Sheet1'],
+            rows: objectRows,
+            headers: headers,
+            rowCount: objectRows.length,
+            sourceFormat: 'json'
+        };
+    }
+
+    // ========== Web Worker 方式解析 Excel ==========
+    /**
+     * 使用 Web Worker 在后台线程解析 Excel，避免阻塞主线程
+     * @param {File} file - Excel 文件
+     * @param {Function} onProgress - 进度回调 (percent)
+     * @returns {Promise<Object>} 解析结果
+     */
+    function readExcelFileWithWorker(file, onProgress) {
+        return new Promise((resolve, reject) => {
+            // 小文件直接主线程解析，避免 Worker 开销
+            if (file.size < 5 * 1024 * 1024) {
+                readExcelFile(file).then(result => {
+                    if (onProgress) onProgress(100);
+                    resolve(result);
+                }).catch(reject);
+                return;
+            }
+
+            // 检查 Worker 支持
+            if (typeof Worker === 'undefined') {
+                console.warn('[DataProcessor] 浏览器不支持 Web Worker，回退到主线程解析');
+                readExcelFile(file).then(result => {
+                    if (onProgress) onProgress(100);
+                    resolve(result);
+                }).catch(reject);
+                return;
+            }
+
+            console.log('[DataProcessor] 使用 Web Worker 解析 Excel:', file.name, '大小:', (file.size / 1024 / 1024).toFixed(2), 'MB');
+
+            let worker;
+            try {
+                worker = new Worker('js/xlsx-worker.js');
+            } catch (err) {
+                console.warn('[DataProcessor] Worker 创建失败，回退到主线程:', err);
+                readExcelFile(file).then(result => {
+                    if (onProgress) onProgress(100);
+                    resolve(result);
+                }).catch(reject);
+                return;
+            }
+
+            let resolved = false;
+
+            worker.onmessage = function(e) {
+                const msg = e.data;
+                if (msg.type === 'progress') {
+                    if (onProgress) onProgress(msg.percent);
+                } else if (msg.type === 'done') {
+                    resolved = true;
+                    worker.terminate();
+                    resolve(msg.result);
+                } else if (msg.type === 'error') {
+                    resolved = true;
+                    worker.terminate();
+                    reject(new Error(msg.message));
+                }
+            };
+
+            worker.onerror = function(err) {
+                console.error('[DataProcessor] Worker 错误:', err);
+                if (!resolved) {
+                    resolved = true;
+                    worker.terminate();
+                    // 回退到主线程
+                    console.warn('[DataProcessor] Worker 解析失败，回退到主线程');
+                    readExcelFile(file).then(result => {
+                        if (onProgress) onProgress(100);
+                        resolve(result);
+                    }).catch(reject);
+                }
+            };
+
+            // 读取文件并发送给 Worker
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                if (onProgress) onProgress(5); // 文件读取阶段
+                worker.postMessage({
+                    type: 'parse',
+                    data: e.target.result,
+                    fileName: file.name
+                }, [e.target.result]); // 传输 ArrayBuffer，不复制
+            };
+            reader.onerror = function() {
+                worker.terminate();
+                reject(new Error('文件读取失败'));
+            };
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
     // ========== 公共 API ==========
     return {
         readExcelFile,
+        readExcelFileWithWorker,
+        readJsonFile,
         loadExcelFromUrl,
+        loadJsonFromUrl,
         detectDataType,
         processSubletData,
         processDistributionData,

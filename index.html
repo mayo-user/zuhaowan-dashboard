@@ -30,12 +30,12 @@
             <div class="upload-section">
                 <div class="upload-group">
                     <label class="upload-label">本周数据</label>
-                    <input type="file" id="fileThisWeek" accept=".xlsx,.xls" class="file-input">
+                    <input type="file" id="fileThisWeek" accept=".xlsx,.xls,.json" class="file-input">
                     <label for="fileThisWeek" class="upload-btn">选择文件</label>
                 </div>
                 <div class="upload-group">
                     <label class="upload-label">上周数据</label>
-                    <input type="file" id="fileLastWeek" accept=".xlsx,.xls" class="file-input">
+                    <input type="file" id="fileLastWeek" accept=".xlsx,.xls,.json" class="file-input">
                     <label for="fileLastWeek" class="upload-btn">选择文件</label>
                 </div>
             </div>
@@ -511,31 +511,44 @@
                     </div>
                 </div>
 
-                <div class="settings-section" id="urlConfigSection" style="display:none;">
-                    <div class="settings-section-title">URL 配置</div>
-                    <div class="url-config-group">
-                        <div class="url-config-item">
-                            <label>转租 - 本周数据</label>
-                            <input type="text" id="urlSubletThisWeek" placeholder="请输入Excel文件的公开链接">
+                <div id="urlConfigSection">
+                    <div class="settings-section">
+                        <div class="settings-section-title">URL 配置</div>
+                        <div class="url-config-group">
+                            <div class="url-config-item">
+                                <label>转租 - 本周数据</label>
+                                <input type="text" id="urlSubletThisWeek" placeholder="请输入Excel或JSON文件的公开链接">
+                            </div>
+                            <div class="url-config-item">
+                                <label>转租 - 上周数据</label>
+                                <input type="text" id="urlSubletLastWeek" placeholder="请输入Excel或JSON文件的公开链接">
+                            </div>
+                            <div class="url-config-item">
+                                <label>分销 - 本周数据</label>
+                                <input type="text" id="urlDistThisWeek" placeholder="请输入Excel或JSON文件的公开链接">
+                            </div>
+                            <div class="url-config-item">
+                                <label>分销 - 上周数据</label>
+                                <input type="text" id="urlDistLastWeek" placeholder="请输入Excel或JSON文件的公开链接">
+                            </div>
                         </div>
-                        <div class="url-config-item">
-                            <label>转租 - 上周数据</label>
-                            <input type="text" id="urlSubletLastWeek" placeholder="请输入Excel文件的公开链接">
+                        <div class="settings-hint">
+                            提示：配置后页面打开时将自动从URL加载数据。推荐使用 .json 格式（加载速度快 10 倍以上）。
                         </div>
-                        <div class="url-config-item">
-                            <label>分销 - 本周数据</label>
-                            <input type="text" id="urlDistThisWeek" placeholder="请输入Excel文件的公开链接">
-                        </div>
-                        <div class="url-config-item">
-                            <label>分销 - 上周数据</label>
-                            <input type="text" id="urlDistLastWeek" placeholder="请输入Excel文件的公开链接">
+                        <div class="settings-hint warning" style="margin-top:8px;">
+                            注意：飞书云盘分享链接可能存在浏览器跨域（CORS）限制，如无法加载请使用支持CORS的文件托管服务。
                         </div>
                     </div>
-                    <div class="settings-hint">
-                        提示：配置后页面打开时将自动从URL加载数据。链接需为公开可访问的Excel文件直链。
+                </div>
+
+                <div class="settings-section">
+                    <div class="settings-section-title">数据缓存</div>
+                    <div class="settings-hint" style="margin-bottom:10px;">
+                        浏览器会缓存已解析的数据，下次加载相同文件时瞬间完成。
                     </div>
-                    <div class="settings-hint warning" style="margin-top:8px;">
-                        注意：飞书云盘分享链接可能存在浏览器跨域（CORS）限制，如无法加载请使用支持CORS的文件托管服务。
+                    <div class="cache-info-row">
+                        <span>当前缓存条目：<strong id="cacheCount">--</strong></span>
+                        <button id="clearCacheBtn" class="settings-btn-secondary small">清空缓存</button>
                     </div>
                 </div>
             </div>
@@ -551,7 +564,12 @@
     <div id="loadingOverlay" class="loading-overlay hidden">
         <div class="loading-content">
             <div class="loading-spinner"></div>
-            <div class="loading-text">数据加载中...</div>
+            <div class="loading-text" id="loadingText">数据加载中...</div>
+            <div class="loading-progress-container" id="loadingProgressContainer" style="display:none;">
+                <div class="loading-progress-bar"><div id="loadingProgressFill"></div></div>
+                <div class="loading-progress-text" id="loadingProgressText">0%</div>
+            </div>
+            <div class="loading-tip" id="loadingTip" style="display:none;"></div>
         </div>
     </div>
 
@@ -567,6 +585,7 @@
 
     <script src="js/echarts.min.js"></script>
     <script src="js/xlsx.full.min.js"></script>
+    <script src="js/storageCache.js"></script>
     <script src="js/dataProcessor.js"></script>
     <script src="js/charts.js"></script>
     <script src="js/main.js"></script>
